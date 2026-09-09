@@ -1,0 +1,29 @@
+{
+  "name": "agent-island",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unified always-on-top monitor for local AI coding agents",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli/dev.ts",
+    "start": "tsx src/cli/dev.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "hooks:install": "tsx src/cli/hooks.ts install",
+    "hooks:uninstall": "tsx src/cli/hooks.ts uninstall",
+    "hooks:dry": "tsx src/cli/hooks.ts dry"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.4"
+  }
+}
