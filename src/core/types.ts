@@ -23,6 +23,12 @@ export type Usage = {
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
   costUSD?: number;
+  /**
+   * Session total, when the tool reports one. Some tools report only this
+   * aggregate and leave the per-direction fields at zero, so a renderer must
+   * fall back to it rather than showing "0 out".
+   */
+  totalTokens?: number;
 };
 
 /** What a session is blocked on. Populated from hook events only. */

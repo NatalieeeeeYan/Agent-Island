@@ -2,6 +2,11 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import chokidar from 'chokidar';
 
+import {
+  defaultSidecarRoot,
+  loadSidecars,
+  type SidecarEntry,
+} from '../claude-desktop-sidecar.js';
 import { debounceByKey } from '../debounce.js';
 import { listJsonl, pathExists, selectForScan } from '../fs-util.js';
 import {
@@ -9,6 +14,7 @@ import {
   foldClaudeCodeRows,
   type ClaudeCodeFacts,
 } from '../parsers/claude-code.js';
+import { titleFromMessage } from '../parsers/util.js';
 import { statusFromActivity } from '../status.js';
 import { TranscriptTracker } from '../transcript-tracker.js';
 import type {
@@ -33,13 +39,16 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   };
 
   readonly #root: string;
+  readonly #sidecarRoot: string;
   readonly #tracker = new TranscriptTracker<ClaudeCodeFacts>(
     emptyClaudeCodeFacts,
     foldClaudeCodeRows,
   );
+  #sidecars = new Map<string, SidecarEntry>();
 
-  constructor(options: { root?: string } = {}) {
+  constructor(options: { root?: string; sidecarRoot?: string } = {}) {
     this.#root = options.root ?? join(homedir(), '.claude', 'projects');
+    this.#sidecarRoot = options.sidecarRoot ?? defaultSidecarRoot();
   }
 
   async detect(): Promise<boolean> {
@@ -47,6 +56,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }
 
   async scan(options: ScanOptions = {}): Promise<Session[]> {
+    this.#sidecars = await loadSidecars(this.#sidecarRoot);
     const files = selectForScan(await listJsonl(this.#root), options);
     const sessions: Session[] = [];
     for (const file of files) {
@@ -89,12 +99,50 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       emit({ kind: 'adapter_error', tool: this.id, message: String(error) });
     });
 
+    // Desktop titles arrive in the sidecar, not the transcript, so it needs its
+    // own watcher — same shape as the Codex session index.
+    const sidecars = chokidar.watch(this.#sidecarRoot, { ignoreInitial: true, depth: 3 });
+    const reloadSidecars = debounceByKey(() => {
+      void this.#reloadSidecars(emit);
+    }, WATCH_DEBOUNCE_MS);
+    sidecars.on('add', () => reloadSidecars.call('sidecars'));
+    sidecars.on('change', () => reloadSidecars.call('sidecars'));
+    // Titles are an enhancement, and this path is absent without Claude Desktop
+    // — swallow rather than surface an adapter error, but never leave 'error'
+    // unhandled, which would throw.
+    sidecars.on('error', () => {});
+
     return {
       dispose: () => {
         refresh.cancelAll();
+        reloadSidecars.cancelAll();
         void watcher.close();
+        void sidecars.close();
       },
     };
+  }
+
+  /**
+   * Desktop writes the sidecar's `title` a few turns in, long after the session
+   * first appeared. Reloading the map is not enough — a session that is idle by
+   * then would keep its fallback title until the next restart, so every session
+   * whose title actually changed is re-emitted.
+   */
+  async #reloadSidecars(emit: EventSink): Promise<void> {
+    const previous = this.#sidecars;
+    this.#sidecars = await loadSidecars(this.#sidecarRoot);
+
+    for (const path of this.#tracker.paths()) {
+      const facts = this.#tracker.facts(path);
+      // No timestamp means no basis for a status — leave it as first scanned.
+      if (!facts || facts.lastTimestamp === null) continue;
+
+      const id = facts.sessionId ?? basename(path, '.jsonl');
+      if (previous.get(id)?.title === this.#sidecars.get(id)?.title) continue;
+
+      const session = this.#build(facts, path, facts.lastTimestamp);
+      if (session) emit({ kind: 'session_updated', session });
+    }
   }
 
   async #refresh(path: string, seen: Set<string>, emit: EventSink): Promise<void> {
@@ -117,7 +165,8 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     const session: Session = {
       id,
       tool: this.id,
-      title: facts.title,
+      title:
+        this.#sidecars.get(id)?.title ?? facts.title ?? titleFromMessage(facts.firstUserMessage),
       cwd: facts.cwd ?? '',
       status: statusFromActivity(lastActivity),
       startedAt: facts.firstTimestamp ?? mtimeMs,

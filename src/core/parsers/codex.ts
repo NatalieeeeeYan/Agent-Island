@@ -10,9 +10,12 @@ import { num, obj, str, timestamp } from './util.js';
  *
  * Note the title is *not* in the rollout — it lives in
  * `~/.codex/session_index.jsonl` as `thread_name`, which the adapter joins in.
+ * Codex Desktop does not write that index, so `firstUserMessage` is kept as a
+ * fallback for sessions the index never learns about.
  */
 export type CodexFacts = {
   sessionId: string | null;
+  firstUserMessage: string | null;
   cwd: string | null;
   model: string | null;
   cliVersion: string | null;
@@ -33,6 +36,7 @@ export type CodexFacts = {
 export function emptyCodexFacts(): CodexFacts {
   return {
     sessionId: null,
+    firstUserMessage: null,
     cwd: null,
     model: null,
     cliVersion: null,
@@ -94,6 +98,10 @@ function applyEventMsg(
   rowTs: number | null,
 ): void {
   switch (str(payload['type'])) {
+    case 'user_message': {
+      facts.firstUserMessage ??= str(payload['message']);
+      break;
+    }
     case 'task_started': {
       facts.openTurns += 1;
       break;
@@ -122,6 +130,10 @@ function applyEventMsg(
  * `token_count.info.total_token_usage` is cumulative for the session.
  * Codex reports no dollar cost, so `costUSD` stays absent — the UI must render
  * that as "no cost data", never as zero.
+ *
+ * Codex Desktop fills in `total_tokens` but leaves every per-direction field at
+ * zero, so `totalTokens` is carried through as the only honest number available
+ * for those sessions.
  */
 function parseTokenCount(payload: Record<string, unknown>): Usage | null {
   const total = obj(obj(payload['info'])?.['total_token_usage']);
@@ -133,8 +145,10 @@ function parseTokenCount(payload: Record<string, unknown>): Usage | null {
   };
   const cached = num(total['cached_input_tokens']);
   const written = num(total['cache_write_input_tokens']);
+  const grandTotal = num(total['total_tokens']);
   if (cached !== null && cached > 0) usage.cacheReadTokens = cached;
   if (written !== null && written > 0) usage.cacheCreationTokens = written;
+  if (grandTotal !== null && grandTotal > 0) usage.totalTokens = grandTotal;
   return usage;
 }
 

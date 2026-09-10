@@ -59,6 +59,7 @@ src/core/            zero Electron dependencies — runs under plain node
   store.ts             SessionStore interface + MemoryStore
   status.ts            what status a transcript alone can honestly support
   jsonl.ts             incremental JSONL reader (byte-offset cursor)
+  claude-desktop-sidecar.ts  titles for sessions launched from Claude Desktop
   hook-server.ts       loopback receiver on 127.0.0.1:7821
   hook-install.ts      idempotent merge into the tools' settings files
   parsers/             per-tool transcript folding, pure functions
@@ -89,7 +90,7 @@ tool's implementation.
 | Command | Purpose |
 |---------|---------|
 | `npm run dev` | Headless backend with live output (watch mode) |
-| `npm test` | Vitest suite (41 tests) |
+| `npm test` | Vitest suite |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run hooks:dry` | Preview hook installation |
 | `npm run hooks:install` | Install hooks |

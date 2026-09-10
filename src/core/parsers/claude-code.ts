@@ -12,6 +12,12 @@ import { num, obj, str, timestamp } from './util.js';
 export type ClaudeCodeFacts = {
   sessionId: string | null;
   title: string | null;
+  /**
+   * Fallback title source. `ai-title` only lands after a few turns, and sessions
+   * launched from Claude Desktop never get one — their title lives in the
+   * desktop sidecar instead.
+   */
+  firstUserMessage: string | null;
   cwd: string | null;
   gitBranch: string | null;
   model: string | null;
@@ -27,6 +33,7 @@ export function emptyClaudeCodeFacts(): ClaudeCodeFacts {
   return {
     sessionId: null,
     title: null,
+    firstUserMessage: null,
     cwd: null,
     gitBranch: null,
     model: null,
@@ -94,6 +101,10 @@ export function foldClaudeCodeRows(
         }
         break;
       }
+      case 'user': {
+        facts.firstUserMessage ??= humanText(obj(r['message']));
+        break;
+      }
       case 'system': {
         facts.lastStopReason = str(r['stopReason']) ?? facts.lastStopReason;
         break;
@@ -109,6 +120,23 @@ export function foldClaudeCodeRows(
   }
 
   return facts;
+}
+
+/**
+ * Text the human actually typed. `user` rows also carry tool results, whose
+ * content is an array of `tool_result` blocks — those are not a prompt and must
+ * not become a title.
+ */
+function humanText(message: Record<string, unknown> | null): string | null {
+  if (!message) return null;
+  const content = message['content'];
+  if (typeof content === 'string') return str(content);
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    const b = obj(block);
+    if (b && str(b['type']) === 'text') return str(b['text']);
+  }
+  return null;
 }
 
 /**

@@ -122,6 +122,30 @@ M1 只做监控和提醒；在 Island 上直接点允许/拒绝推迟到 M2。
 
 ---
 
+### ADR-008 · hook 事件持久化为追加式日志；会话状态不做事件溯源
+**日期：** 2026-09-08 · **状态：** 已采纳 · **细化：** ADR-005
+
+hook 事件写入一条持久的追加式日志，随 `SqliteStore` 一同落地。会话状态仍然是由会话记录推导出的可变记录，**不**通过回放该日志重建。
+
+**为什么要持久化 hook 事件：** 它是 Island 手里唯一一份磁盘上没有的证据。会话记录说明 agent 做了什么，hook 说明它*卡在什么上*、*什么时候停下来*——`waiting` 和 `complete` 没有第二个来源（见 `status.ts`）。现在 `HookEvent` 折进 `Session` 之后就被丢弃，于是一次审批等了多久、某一轮在哪一刻结束、一个会话被打断过几次，全都随进程退出消失。之后所有值得问的问题——平均阻塞时长、哪个工具最容易卡住、今天跑了多少轮、活动时间线——要的正是这份数据，且事后无法补回。
+
+**为什么不把会话状态做成事件溯源：**
+
+1. **磁盘上的会话记录本身就是那条追加式日志。** ADR-003 正是依赖这一点：下次启动补扫即可恢复历史，Island 自己什么都不用存。再造一条承载同样事实的日志就是第二个真值源，两者迟早会打架。
+2. **`reduce(log) → state` 与第 6 节的扫描边界冲突。** 启动时刻意只解析最近的会话记录，按 mtime 倒序并设上限。从完整事件历史重建状态要么无视这个边界，要么得再加快照把边界补回来——在当前规模下是净增成本，没有对应收益。
+3. **本地唯一的收益已经拿到了。** 事件溯源在这里能解决的问题——会话记录重读覆盖掉 hook 设置的 `waiting`——已由 `mergeSession` 处理。
+
+**记什么：** 规范化后的 `HookEvent`，以及它引发的状态迁移。不记 `SessionEvent` 这类存储层增量：`session_updated` 只说明记录变了，说明不了发生了什么。
+
+**后果：**
+
+- `SessionStore.recordEvent()` / `events()` 目前没有消费者。保留它们——本 ADR 就是它们的规格——等存储落地时接上。在那之前它们是明知故留的死代码，不是遗漏。
+- 保留策略有界，但在拿到真实的行数量级之前不定死。
+- 运行路径上的任何东西都不得依赖这条日志可写。hook 脚本的 fail-open 契约（第 7 节）不变：日志写不进去只是丢一行，绝不能变成卡住 agent。
+- 不给 M1、M2 增加任何要求。
+
+---
+
 ## 3. 架构
 
 ```
@@ -233,6 +257,12 @@ JSONL 行类型及可用字段：
 
 Hook 配置：`~/.claude/settings.json`（**用户级**，非项目级——要监控所有会话）。
 
+**标题的三级来源**（2026-09-09 实测）。`ai-title` 不是唯一来源，只用它会让大量会话显示 `(untitled)`：
+
+1. **桌面侧车** `~/Library/Application Support/Claude/claude-code-sessions/<org>/<user>/local_*.json` 的 `title`。Claude Desktop 起的会话写的就是 `~/.claude/projects/` 下的同一批 jsonl，但**不产生 `ai-title` 行**；侧车的 `cliSessionId` 就是那个 jsonl 的 session id。`titleSource: "auto"` 说明它是工具自己生成的，与 `aiTitle` 同级可信。
+2. **`ai-title` 行**的 `aiTitle`。终端会话用这条，但要跑几轮才出现。
+3. **首条 `user` 行的文本**，取首行并截断。仅兜底——注意 `user` 行也承载 `tool_result`（`content` 是数组且块 `type` 为 `tool_result`），那不是提问，不能当标题。
+
 ### Codex
 
 ```
@@ -250,6 +280,11 @@ Hook 配置：`~/.claude/settings.json`（**用户级**，非项目级——要�
 | `turn_context` | `cwd`、`workspace_roots`、`approval_policy` |
 
 Hook 事件：`SessionStart` / `UserPromptSubmit` / `PreToolUse` / **`PermissionRequest`**。最后一个是专门的审批事件，比 Claude Code 更直接。
+
+**Codex Desktop 是同一个适配器的降级情形**（2026-09-09 实测）。它写同样的 rollout（`session_meta.originator = "Codex Desktop"`、`source: "vscode"`），但有两处缺口：
+
+- **不写 `session_index.jsonl`。** 本机该文件最后更新停在 2026-08-27，之后的会话 id 在里面查不到，所以 `thread_name` 恒为空 → 标题回退到首条 `event_msg: user_message` 的 `message`，取首行并截断。
+- **`token_count` 只报总数。** `info.total_token_usage` 里 `input_tokens` / `output_tokens` / `cached_input_tokens` 全是 0，真实值只在 `total_tokens`。所以 `Usage` 增加了可选的 `totalTokens`，渲染时优先用 out/in，没有才退回总数——**不能把 0 当成真实的输出量显示**，那和用 `—` 冒充零成本是同一类错误（ADR-004）。
 
 ### Cursor（M3）
 
@@ -288,9 +323,29 @@ Cowork 本质就是 **Claude Code 跑在桌面 App 里**，会话记录格式与
 
 ### 明确不支持：纯聊天产品
 
-Claude 网页/App 对话、ChatGPT 对话**监控不了**——对话在服务端，本地不落盘（`~/Library/Application Support/com.openai.chat/` 实测只有 `app_pairing_extensions/`）。
+**复核于 2026-09-09。** 结论不变，但两个产品的原因不同——之前笼统写成「都在服务端」并不准确。
 
-而且它们本来也不该上这个 Island：Island 的价值是「agent 在后台跑、我需要知道它啥时候要我」。聊天是同步的，用户就坐在屏幕前。
+**ChatGPT 桌面 App —— 技术上不可能。** 本地零对话数据，实测覆盖 `~/Library/Application Support/com.openai.chat/`（只有 `app_pairing_extensions/`，是 VS Code 配对记录）、`~/Library/Containers/`、`~/Library/Group Containers/2DC432GLL2.*`、`~/Library/Caches/`。没有可解析的东西，不是难做，是无米下锅。唯一的路径是 Accessibility API 读窗口文本或走 OpenAI 后端 API，两者都不是本地被动监控（违反 ADR-002）。
+
+**Claude 桌面 App —— 技术上可行，但不值。** 对话确实缓存在本地：
+
+```
+~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/
+  → object store "claude-conversation-store"（conversationUuid / title / messageCount / parent_message_uuid）
+```
+
+读它要同时解决三件事，任何一件都比现有全部适配器加起来更重：
+
+1. **LevelDB 读取。** 纯 JS 实现质量不可用，`classic-level` 是原生模块——与「不引原生模块」（ADR-005 备注）冲突。
+2. **Blink SSV 反序列化。** IndexedDB 的 value 是 Chromium 私有二进制序列化格式，得自己写解码器。
+3. **文件被占用。** App 运行时持有 `LOCK`，只能整目录快照后读，且格式随 App 版本漂移，属于典型的高维护面。
+
+**判据仍然是价值而非成本。** Island 的价值是「agent 在后台跑、我需要知道它啥时候要我」。聊天是同步的，用户就坐在屏幕前，没有需要被通知的时刻。即使解析成本为零也不该上岛。
+
+**容易混淆的两件事，都不是「聊天」，都在支持范围内：**
+
+- **Codex Desktop** 写的就是 `~/.codex/sessions/` 里同一批 rollout（`session_meta.originator = "Codex Desktop"`），现有 Codex 适配器**已经覆盖**。它不写 `session_index.jsonl`，所以标题走首条用户消息兜底。
+- **Claude Desktop 里跑的 Claude Code** 写的就是 `~/.claude/projects/` 里同一批会话记录，现有适配器**已经覆盖**。它不产生 `ai-title` 行，标题在侧车文件里（见下）。
 
 ---
 
@@ -308,7 +363,7 @@ interface SessionStore {
 ```
 
 - **M1** — `MemoryStore`。启动时各适配器 `scan()` 补齐历史，运行时 `watch()` 增量更新。
-- **M2** — `SqliteStore`（`node:sqlite`）。换实现只动实例化那一行。落库的触发条件：模型稳定，且启动扫描变慢到影响体验。
+- **M2** — `SqliteStore`（`node:sqlite`），以及 hook 事件日志（ADR-008）。换实现只动实例化那一行。落库的触发条件：模型稳定，且启动扫描变慢到影响体验。
 
 **扫描性能约束：** 本机现有 22 个 Claude Code 会话共 16MB、69 个 Codex 会话。启动时**不全量解析**——按 mtime 只完整解析最近 N 个（默认最近 7 天），更老的走索引文件或惰性加载。
 
@@ -426,6 +481,7 @@ ipcMain → 'sessions:removed'
 
 - [ ] 岛上点审批（hook 长轮询 + 超时 fail-open，见 ADR-006）
 - [ ] `SqliteStore` 持久化
+- [ ] hook 事件日志随之持久化（ADR-008）
 - [ ] Claude Desktop（Cowork）适配器 — 复用 Claude Code 解析器 + 侧车文件扫描
 - [ ] Cursor 适配器（降级模式）
 

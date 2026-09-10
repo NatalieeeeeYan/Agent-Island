@@ -2,9 +2,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { parseSidecar } from '../src/core/claude-desktop-sidecar.js';
 import { readJsonl } from '../src/core/jsonl.js';
 import { foldClaudeCodeRows } from '../src/core/parsers/claude-code.js';
 import { foldCodexRows, parseCodexIndex } from '../src/core/parsers/codex.js';
+import { titleFromMessage } from '../src/core/parsers/util.js';
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
@@ -59,6 +61,33 @@ describe('claude code parser', () => {
     ]);
 
     expect(facts.title).toBe('Still parsed');
+  });
+
+  it('keeps the first human prompt and ignores tool results', () => {
+    const facts = foldClaudeCodeRows([
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: 'first prompt' }] },
+      },
+      { type: 'user', message: { role: 'user', content: 'second prompt' } },
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'tool_result', content: 'not a prompt' }] },
+      },
+    ]);
+
+    expect(facts.firstUserMessage).toBe('first prompt');
+  });
+
+  it('records no prompt when every user row is a tool result', () => {
+    const facts = foldClaudeCodeRows([
+      {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'tool_result', content: 'ls output' }] },
+      },
+    ]);
+
+    expect(facts.firstUserMessage).toBeNull();
   });
 });
 
@@ -127,5 +156,68 @@ describe('codex parser', () => {
 
     expect(entry?.threadName).toBe('解释 Floss 和 Root Canal 重构');
     expect(entry?.updatedAt).toBeGreaterThan(0);
+  });
+
+  it('carries total_tokens for Desktop sessions that report no in/out split', () => {
+    const facts = foldCodexRows([
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cached_input_tokens: 0,
+              total_tokens: 14959,
+            },
+          },
+        },
+      },
+    ]);
+
+    expect(facts.usage).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 14959 });
+  });
+
+  it('keeps the first user message as a title fallback', () => {
+    const facts = foldCodexRows([
+      { type: 'event_msg', payload: { type: 'user_message', message: 'first ask' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'second ask' } },
+    ]);
+
+    expect(facts.firstUserMessage).toBe('first ask');
+  });
+});
+
+describe('title fallback', () => {
+  it('takes the opening line and truncates long prompts', () => {
+    expect(titleFromMessage('  fix the parser  ')).toBe('fix the parser');
+    expect(titleFromMessage('line one\nline two')).toBe('line one');
+    expect(titleFromMessage('x'.repeat(80))).toBe(`${'x'.repeat(59)}…`);
+    expect(titleFromMessage('   \n  ')).toBeNull();
+    expect(titleFromMessage(null)).toBeNull();
+  });
+});
+
+describe('claude desktop sidecar', () => {
+  it('maps a sidecar onto the transcript it describes', () => {
+    const entry = parseSidecar({
+      sessionId: 'local_d4a9f9cb',
+      cliSessionId: 'a41f164c-1fb8-43eb-959e-47145c55e4a5',
+      title: 'Agent Island 架构设计评审',
+      titleSource: 'auto',
+      lastActivityAt: 1788934782285,
+    });
+
+    expect(entry).toEqual({
+      cliSessionId: 'a41f164c-1fb8-43eb-959e-47145c55e4a5',
+      title: 'Agent Island 架构设计评审',
+      lastActivityAt: 1788934782285,
+    });
+  });
+
+  it('skips files in the same directory that describe no session', () => {
+    expect(parseSidecar({ tasks: [] })).toBeNull();
+    expect(parseSidecar('not an object')).toBeNull();
   });
 });

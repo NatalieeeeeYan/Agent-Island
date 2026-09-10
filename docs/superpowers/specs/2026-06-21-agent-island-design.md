@@ -122,6 +122,30 @@ Claude Desktop's Cowork / agent mode gets its own adapter, in M3 (alongside the 
 
 ---
 
+### ADR-008 · Hook events get a persisted append-only log; session state is not event-sourced
+**Date:** 2026-09-08 · **Status:** Accepted · **Refines:** ADR-005
+
+Hook events are recorded to a durable append-only log that lands together with `SqliteStore`. Session state remains a mutable record derived from transcripts — it is **not** reconstructed by replaying that log.
+
+**Why persist hook events:** They are the only evidence Island holds that is not already on disk. A transcript records what an agent did; a hook records what it was *blocked on* and *when it stopped* — `waiting` and `complete` have no other source (see `status.ts`). Today a `HookEvent` is folded into a `Session` and dropped, so how long an approval sat unanswered, the moment a turn ended, and how often a session was interrupted all die when the process exits. Every question worth asking later — mean time blocked, which tool stalls most, how many turns ran today, the activity timeline — needs exactly this data and cannot recover it afterwards.
+
+**Why not event-source session state:**
+
+1. **The transcripts already are the append-only log.** ADR-003 depends on this: a catch-up scan on next launch recovers history without Island having stored anything. A second log carrying the same facts is a second source of truth, and the two will disagree.
+2. **`reduce(log) → state` fights the scan bound in §6.** Startup deliberately parses only the most recent transcripts, newest first, capped. Rebuilding state from a full event history either ignores that bound or needs snapshots to restore it — cost with no matching benefit at this scale.
+3. **The one local win is already had.** The problem event sourcing would solve here — a transcript re-read clobbering a hook-set `waiting` — is handled in `mergeSession`.
+
+**What is logged:** the normalized `HookEvent` plus the status transition it caused. Not `SessionEvent` store deltas: `session_updated` says the record changed, not what happened.
+
+**Consequences:**
+
+- `SessionStore.recordEvent()` / `events()` have no consumer today. They stay — this ADR is their specification — and get one when the store lands. Until then they are knowingly dead code, not an oversight.
+- Retention is bounded and left unspecified until there is a real row count to reason about.
+- Nothing on the running path may depend on the log being writable. The hook script's fail-open contract (§7) is unchanged: a log that cannot be written is a lost row, never a stalled agent.
+- No requirement is added to M1 or M2.
+
+---
+
 ## 3. Architecture
 
 ```
@@ -231,6 +255,12 @@ type Session = {
 
 Hook config: `~/.claude/settings.json` (**user level**, not project level — we monitor all sessions).
 
+**Titles have three sources** (verified 2026-09-09). `ai-title` is not the only one; relying on it alone leaves a large share of sessions showing `(untitled)`:
+
+1. **Desktop sidecar** — `~/Library/Application Support/Claude/claude-code-sessions/<org>/<user>/local_*.json`, field `title`. Sessions launched from Claude Desktop write the same transcripts under `~/.claude/projects/` but **emit no `ai-title` row**; the sidecar's `cliSessionId` is that transcript's session id. `titleSource: "auto"` marks it as tool-generated, as trustworthy as `aiTitle`.
+2. **`ai-title` rows** — used by terminal sessions, but only after several turns.
+3. **First `user` row's text**, first line, truncated. Fallback only — note that `user` rows also carry tool results (`content` is an array whose blocks have `type: "tool_result"`); those are not a prompt and must never become a title.
+
 ### Codex
 
 ```
@@ -248,6 +278,11 @@ Hook config: `~/.claude/settings.json` (**user level**, not project level — we
 | `turn_context` | `cwd`, `workspace_roots`, `approval_policy` |
 
 Hook events: `SessionStart` / `UserPromptSubmit` / `PreToolUse` / **`PermissionRequest`**. That last one is a dedicated approval event — more direct than anything Claude Code offers.
+
+**Codex Desktop is a degraded case of the same adapter** (verified 2026-09-09). It writes the same rollouts (`session_meta.originator = "Codex Desktop"`, `source: "vscode"`), with two gaps:
+
+- **It does not write `session_index.jsonl`.** On this machine that file's last update is 2026-08-27; ids of later sessions are absent, so `thread_name` is always missing → the title falls back to the first `event_msg: user_message`, first line, truncated.
+- **`token_count` reports only a total.** In `info.total_token_usage`, `input_tokens` / `output_tokens` / `cached_input_tokens` are all zero and the real number lives in `total_tokens`. `Usage` therefore carries an optional `totalTokens`; renderers prefer the in/out split and fall back to the total — **showing that zero as real output is not an option**, being the same class of mistake as a `—` that reads as zero cost (ADR-004).
 
 ### Cursor (M3)
 
@@ -286,9 +321,29 @@ Cowork is **Claude Code running inside the desktop app**. Transcript format is i
 
 ### Explicitly unsupported: pure chat products
 
-Claude web/app conversations and ChatGPT conversations **cannot be monitored** — they live server-side with nothing on disk (`~/Library/Application Support/com.openai.chat/` contains only `app_pairing_extensions/`).
+**Re-checked 2026-09-09.** The conclusion holds, but the two products fail for different reasons — the earlier blanket "it's all server-side" was not accurate.
 
-They also don't belong here: Island exists because an agent runs in the background and you need to know when it needs you. Chat is synchronous — you're already looking at it.
+**ChatGPT desktop app — technically impossible.** Zero local conversation data. Verified across `~/Library/Application Support/com.openai.chat/` (only `app_pairing_extensions/`, a VS Code pairing record), `~/Library/Containers/`, `~/Library/Group Containers/2DC432GLL2.*`, and `~/Library/Caches/`. There is nothing to parse — not hard, just absent. The only routes are reading window text via the Accessibility API or calling OpenAI's backend, neither of which is local passive monitoring (ADR-002).
+
+**Claude desktop app — technically possible, not worth it.** Conversations really are cached locally:
+
+```
+~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb/
+  → object store "claude-conversation-store" (conversationUuid / title / messageCount / parent_message_uuid)
+```
+
+Reading it means solving three problems at once, any one of which outweighs every adapter written so far:
+
+1. **LevelDB access.** Pure-JS implementations are not usable; `classic-level` is a native module, conflicting with the no-native-modules constraint (ADR-005 note).
+2. **Blink SSV decoding.** IndexedDB values use Chromium's private binary serialization format, so the decoder would have to be written from scratch.
+3. **The file is in use.** The app holds `LOCK` while running, forcing a directory snapshot before every read, and the format drifts with app versions — a large maintenance surface.
+
+**The deciding factor is value, not cost.** Island exists because an agent runs in the background and you need to know when it needs you. Chat is synchronous — you are already looking at it, and there is no moment you need to be told about. Even at zero parsing cost it would not belong on the island.
+
+**Two things that look like chat but are not, and are already supported:**
+
+- **Codex Desktop** writes the same rollouts under `~/.codex/sessions/` (`session_meta.originator = "Codex Desktop"`); the existing Codex adapter **already covers it**. It writes no `session_index.jsonl`, so titles fall back to the first user message.
+- **Claude Code running inside Claude Desktop** writes the same transcripts under `~/.claude/projects/`; the existing adapter **already covers it**. It produces no `ai-title` row — the title lives in the sidecar (see above).
 
 ---
 
@@ -306,7 +361,7 @@ interface SessionStore {
 ```
 
 - **M1** — `MemoryStore`. Adapters `scan()` on startup to backfill, `watch()` for incremental updates.
-- **M2** — `SqliteStore` (`node:sqlite`). Swapping touches one line. Trigger for landing it: the model has stabilized, and startup scans have gotten slow enough to hurt.
+- **M2** — `SqliteStore` (`node:sqlite`), plus the hook event log (ADR-008). Swapping touches one line. Trigger for landing it: the model has stabilized, and startup scans have gotten slow enough to hurt.
 
 **Scan performance constraint:** This machine currently has 22 Claude Code sessions totalling 16 MB and 69 Codex sessions. Startup does **not** fully parse everything — sort by mtime and fully parse only the most recent N (default: last 7 days); older sessions come from index files or lazy loading.
 
@@ -424,6 +479,7 @@ ipcMain → 'sessions:removed'
 
 - [ ] Approve from the island (hook long-poll + fail-open timeout, see ADR-006)
 - [ ] `SqliteStore` persistence
+- [ ] Hook event log persisted alongside it (ADR-008)
 - [ ] Claude Desktop (Cowork) adapter — reuse Claude Code parser + sidecar scanner
 - [ ] Cursor adapter (degraded mode)
 

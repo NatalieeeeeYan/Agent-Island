@@ -12,6 +12,7 @@ import {
   type CodexFacts,
   type CodexIndexEntry,
 } from '../parsers/codex.js';
+import { titleFromMessage } from '../parsers/util.js';
 import { statusFromActivity } from '../status.js';
 import { TranscriptTracker } from '../transcript-tracker.js';
 import type {
@@ -143,7 +144,8 @@ export class CodexAdapter implements AgentAdapter {
     const session: Session = {
       id,
       tool: this.id,
-      title: entry?.threadName ?? null,
+      // Codex Desktop never registers in the index, so fall back to the prompt.
+      title: entry?.threadName ?? titleFromMessage(facts.firstUserMessage),
       cwd: facts.cwd ?? '',
       status: facts.lastError !== null ? 'error' : statusFromActivity(lastActivity),
       startedAt: facts.firstTimestamp ?? mtimeMs,
