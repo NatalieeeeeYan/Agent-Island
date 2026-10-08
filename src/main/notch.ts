@@ -1,4 +1,4 @@
-import { screen, type BrowserWindow, type Rectangle } from 'electron'
+import { globalShortcut, screen, type BrowserWindow, type Rectangle } from 'electron'
 
 import type { Session } from '../core/types.js'
 import { CH, type IslandView } from '../shared/ipc.js'
@@ -52,11 +52,26 @@ export type NotchController = {
 
 export function createNotchController(win: BrowserWindow): NotchController {
   let timer: ReturnType<typeof setTimeout> | null = null
+  // The window is non-focusable so it never gets key events; Esc has to be a
+  // global shortcut, held only while the panel is open so it doesn't swallow
+  // Esc system-wide the rest of the time.
+  let escHeld = false
 
   function clearTimer(): void {
     if (timer) {
       clearTimeout(timer)
       timer = null
+    }
+  }
+
+  function holdEsc(): void {
+    if (!escHeld) escHeld = globalShortcut.register('Escape', collapse)
+  }
+
+  function releaseEsc(): void {
+    if (escHeld) {
+      globalShortcut.unregister('Escape')
+      escHeld = false
     }
   }
 
@@ -68,11 +83,13 @@ export function createNotchController(win: BrowserWindow): NotchController {
     clearTimer()
     win.setBounds(notchBounds('expanded'), true)
     paint({ mode: 'expanded', focus })
+    holdEsc()
     if (auto) timer = setTimeout(collapse, AUTO_COLLAPSE_MS)
   }
 
   function collapse(): void {
     clearTimer()
+    releaseEsc()
     win.setBounds(notchBounds('collapsed'), true)
     paint({ mode: 'collapsed', focus: null })
   }
