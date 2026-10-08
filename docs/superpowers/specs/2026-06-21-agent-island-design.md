@@ -146,6 +146,33 @@ Hook events are recorded to a durable append-only log that lands together with `
 
 ---
 
+### ADR-009 · Session retention window; folds evicted alongside sessions
+
+**Date:** 2026-09-10 · **Status:** Accepted · **Refines:** ADR-005
+
+A session stays on the island only while it has been **active within the last 24 hours**. A `SessionEnd` hook removes it immediately rather than waiting out the window. The startup scan window and the retention window are **the same value**. Eviction drops both the `Session` and the adapter's folded facts.
+
+**Why an approximation is unavoidable.** Island reads files, not processes — a terminal closed yesterday and one open but untouched are identical on disk. Three candidate signals were measured:
+
+| Signal | Verdict |
+|---|---|
+| Process holding the transcript open | ❌ Unusable. `claude` appends and closes; live and historical sessions look the same |
+| Process existence (`ps` + cwd) | ⚠️ Yields "N agents running, in these cwds" but **no session id**; one cwd can host several sessions |
+| Hook events | ✅ The only signal precise to a session, but blind to one already silent before Island started |
+
+So "wrote recently" is the approximation, with `SessionEnd` making the common case (the user quits) exact. **A session blocked on approval is not at risk**: its mtime is the moment of the `PreToolUse` that blocked it, necessarily inside the window.
+
+**Why eviction must reach into the adapters.** Measured: the `Session` records for 44 sessions total a few tens of KB, while the bulk of memory is the facts folded by `TranscriptTracker`. Clearing only the store clears nothing that matters, so `AgentAdapter` gains `forget(before)`.
+
+**Consequences:**
+
+- An evicted session is **rebuilt in full the next time its transcript changes** — title, cwd, usage all recovered — at the cost of one full re-parse. Measured on the largest transcript here, 8.1 MB costs +14.4 MB transient, an amplification of 1.8×. This is the intended trade: idle costs nothing, waking up pays once.
+- The rebuild emits `session_started`, not `session_updated`, so a UI's "new session appeared" path covers revivals too.
+- **`status: 'complete'` is no longer reachable** — only `SessionEnd` ever set it, and that event now removes the session. The variant stays in the type pending an M2 decision about a brief "just finished" display state.
+- Every text folded out of a transcript is clipped to `PREVIEW_MAX_CHARS` (200) at parse time. One row can hold an entire pasted file while only its opening is ever shown; keeping the rest is pure leak.
+
+---
+
 ## 3. Architecture
 
 ```
@@ -217,6 +244,8 @@ type Session = {
   startedAt: number
   updatedAt: number
   usage?: { inputTokens: number; outputTokens: number; costUSD?: number }
+  lastReply?: string          // opening of the agent's latest prose reply, clipped to 200 chars
+  parentId?: string           // present iff this is a subagent; the dispatching session's id
   waitingOn?: { toolName: string; summary: string }   // M2
 }
 ```
@@ -255,11 +284,30 @@ type Session = {
 
 Hook config: `~/.claude/settings.json` (**user level**, not project level — we monitor all sessions).
 
+**Subagent transcripts** (verified 2026-09-10):
+
+```
+~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl                        ← a session the user started
+~/.claude/projects/<encoded-cwd>/<session-uuid>/subagents/agent-<hex>.jsonl  ← a subagent it dispatched
+```
+
+**The trap: every row in a subagent transcript carries the *parent's* `sessionId`.** Using it as `Session.id` collapses a parent and all its subagents into one record, last write winning — observed in practice as a parent session titled with one of its subagents' dispatch prompts. So the id comes from the filename: an `agent-` prefix means the stem is the id and the rows' `sessionId` becomes `parentId`.
+
+**This also settles what status a subagent can have.** Hook events are keyed by `session_id`, and a subagent uses its parent's — so an approval inside a subagent naturally lands on the parent, which is correct, since the user approves it in the parent's terminal. A finished subagent returns as a `tool_result` in the parent and raises no event of its own. Therefore:
+
+- A subagent row's status can only be what file activity supports, `running` or `idle` — **never `waiting` or `complete`**
+- It has no terminal to jump to, so the UI must render it as subordinate to its parent, not as a peer session
+- Interruption (Esc / Ctrl-C) acts on the parent; the subagent stops with it and has no interruption semantics of its own
+
 **Titles have three sources** (verified 2026-09-09). `ai-title` is not the only one; relying on it alone leaves a large share of sessions showing `(untitled)`:
 
 1. **Desktop sidecar** — `~/Library/Application Support/Claude/claude-code-sessions/<org>/<user>/local_*.json`, field `title`. Sessions launched from Claude Desktop write the same transcripts under `~/.claude/projects/` but **emit no `ai-title` row**; the sidecar's `cliSessionId` is that transcript's session id. `titleSource: "auto"` marks it as tool-generated, as trustworthy as `aiTitle`.
 2. **`ai-title` rows** — used by terminal sessions, but only after several turns.
-3. **First `user` row's text**, first line, truncated. Fallback only — note that `user` rows also carry tool results (`content` is an array whose blocks have `type: "tool_result"`); those are not a prompt and must never become a title.
+3. **Last `user` row's text**, first line, truncated. Fallback only.
+
+**Why the last rather than the first.** The island answers "what is it doing now"; an opening prompt goes stale as soon as the session moves on, while the latest ask matches the status beside it. The cost is that the title changes as the session runs, so it cannot be used to recognise a session — but id and cwd already do that.
+
+Note that `user` rows also carry tool results (`content` is an array whose blocks have `type: "tool_result"`); those are not a prompt, so they parse to null and must **not** blank out the prompt already remembered.
 
 ### Codex
 
@@ -342,7 +390,7 @@ Reading it means solving three problems at once, any one of which outweighs ever
 
 **Two things that look like chat but are not, and are already supported:**
 
-- **Codex Desktop** writes the same rollouts under `~/.codex/sessions/` (`session_meta.originator = "Codex Desktop"`); the existing Codex adapter **already covers it**. It writes no `session_index.jsonl`, so titles fall back to the first user message.
+- **Codex Desktop** writes the same rollouts under `~/.codex/sessions/` (`session_meta.originator = "Codex Desktop"`); the existing Codex adapter **already covers it**. It writes no `session_index.jsonl`, so titles fall back to the last user message.
 - **Claude Code running inside Claude Desktop** writes the same transcripts under `~/.claude/projects/`; the existing adapter **already covers it**. It produces no `ai-title` row — the title lives in the sidecar (see above).
 
 ---
@@ -360,7 +408,7 @@ interface SessionStore {
 }
 ```
 
-- **M1** — `MemoryStore`. Adapters `scan()` on startup to backfill, `watch()` for incremental updates.
+- **M1** — `MemoryStore`. Adapters `scan()` on startup to backfill, `watch()` for incremental updates, and a timer evicts past the retention window (ADR-009).
 - **M2** — `SqliteStore` (`node:sqlite`), plus the hook event log (ADR-008). Swapping touches one line. Trigger for landing it: the model has stabilized, and startup scans have gotten slow enough to hurt.
 
 **Scan performance constraint:** This machine currently has 22 Claude Code sessions totalling 16 MB and 69 Codex sessions. Startup does **not** fully parse everything — sort by mtime and fully parse only the most recent N (default: last 7 days); older sessions come from index files or lazy loading.
@@ -384,6 +432,18 @@ Constraints on the hook script:
 
 - **2-second timeout, fail-open** — if Island isn't running, exit silently; never affect the agent
 - Report-only, non-blocking in M1. M2's approval flow long-polls on a separate endpoint.
+
+### Commands for the headless view (stdin, not a third interface)
+
+On a TTY, `npm run dev` also reads commands from stdin: `ls` / `show <id-prefix>` / `fire <id-prefix> <Event> [toolName]` / `help` / `quit`. They live in `src/cli/repl.ts` as `runCommand(line, ctx) => CommandResult` — strings in, strings out, touching neither stdin nor stdout, so every command is unit-testable without a TTY.
+
+**Why the same process rather than a second executable.** A separate process querying a running Island would need a query endpoint, which would falsify "the only HTTP surface" above. Commands over stdin add no HTTP surface at all.
+
+**Why `fire` posts over HTTP instead of calling `applyHookEvent` directly.** `waiting` and `complete` come only from hooks (see `status.ts`), so without synthetic events neither state can be seen without provoking a real approval prompt. Since the point is testing, it must run the same path a real hook does: envelope parsing, the server, the fold into the store, the notification to subscribers. A shortcut would test something other than the thing under test.
+
+The endpoint answers `204` by contract and reports nothing about handling, so `fire` resolves the id prefix against the local store first and refuses without posting when it finds nothing — clear feedback here, no return value added there.
+
+**Ids print at their shortest unambiguous prefix, measured per id.** Codex uses UUIDv7, whose leading hex is a timestamp, so same-day sessions share their first eight characters; a single global width would be dragged to 27 characters by the worst pair, so each id is measured on its own and padded for alignment.
 
 ### Main → renderer (Electron IPC)
 
@@ -463,6 +523,7 @@ ipcMain → 'sessions:removed'
 - [x] Codex adapter: same (proves the abstraction is honest)
 - [x] Hook receiver endpoint + shared relay script (idempotent merge install / uninstall)
 - [x] Headless CLI `npm run dev`: live state stream printed to the terminal
+- [x] Commands for the headless view: `ls` / `show` / `fire`, to drive transitions without a real approval prompt
 - [ ] **Pending your verification**: install hooks, run real sessions, confirm running → waiting → complete
 
 **Definition of done for M1:** Start a real Claude Code session and a real Codex session in other terminals; the CLI shows running → waiting → complete transitions live, with correct title, cwd, and usage.

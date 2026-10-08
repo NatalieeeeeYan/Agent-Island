@@ -1,5 +1,5 @@
 import type { Usage } from '../types.js';
-import { num, obj, str, timestamp } from './util.js';
+import { clip, num, obj, replyText, str, stripInjected, timestamp } from './util.js';
 
 /**
  * Facts extractable from a Claude Code transcript
@@ -16,8 +16,19 @@ export type ClaudeCodeFacts = {
    * Fallback title source. `ai-title` only lands after a few turns, and sessions
    * launched from Claude Desktop never get one — their title lives in the
    * desktop sidecar instead.
+   *
+   * The *latest* ask, not the first: what the agent is working on now is what
+   * you need off a glance at the island, and an opening prompt goes stale as
+   * soon as the session moves on.
    */
-  firstUserMessage: string | null;
+  lastUserMessage: string | null;
+  /**
+   * The dispatch prompt of a subagent turn. Only ever used to title a subagent
+   * transcript, which has no user prompt of its own.
+   */
+  lastSidechainMessage: string | null;
+  /** Opening of the agent's most recent prose reply; no thinking, no tool calls. */
+  lastReply: string | null;
   cwd: string | null;
   gitBranch: string | null;
   model: string | null;
@@ -33,7 +44,9 @@ export function emptyClaudeCodeFacts(): ClaudeCodeFacts {
   return {
     sessionId: null,
     title: null,
-    firstUserMessage: null,
+    lastUserMessage: null,
+    lastSidechainMessage: null,
+    lastReply: null,
     cwd: null,
     gitBranch: null,
     model: null,
@@ -93,6 +106,8 @@ export function foldClaudeCodeRows(
         if (!message) break;
         facts.model = str(message['model']) ?? facts.model;
         facts.lastStopReason = str(message['stop_reason']) ?? facts.lastStopReason;
+        // Turns that only call tools say nothing, and must not blank the reply.
+        facts.lastReply = replyText(proseReply(message)) ?? facts.lastReply;
         const usage = obj(message['usage']);
         if (usage) {
           sawAssistantUsage = true;
@@ -102,7 +117,13 @@ export function foldClaudeCodeRows(
         break;
       }
       case 'user': {
-        facts.firstUserMessage ??= humanText(obj(r['message']));
+        const text = humanText(obj(r['message']));
+        // A sidechain turn is a subagent's dispatch prompt, written by the tool
+        // — in a normal session it must not become the title, and in a subagent
+        // transcript it is the only thing there is. Kept apart, not merged.
+        if (r['isSidechain'] === true) facts.lastSidechainMessage = text ?? facts.lastSidechainMessage;
+        // Tool-result turns yield null and must not blank out the last prompt.
+        else facts.lastUserMessage = text ?? facts.lastUserMessage;
         break;
       }
       case 'system': {
@@ -129,6 +150,27 @@ export function foldClaudeCodeRows(
  */
 function humanText(message: Record<string, unknown> | null): string | null {
   if (!message) return null;
+  const content = message['content'];
+  if (typeof content === 'string') return typed(content);
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    const b = obj(block);
+    if (b && str(b['type']) === 'text') return typed(b['text']);
+  }
+  return null;
+}
+
+function typed(value: unknown): string | null {
+  const text = str(value);
+  return text === null ? null : clip(stripInjected(text));
+}
+
+/**
+ * What the agent actually said, as opposed to what it did. An assistant message
+ * mixes `thinking`, `tool_use` and `text` blocks; only the last is prose the
+ * user would read.
+ */
+function proseReply(message: Record<string, unknown>): string | null {
   const content = message['content'];
   if (typeof content === 'string') return str(content);
   if (!Array.isArray(content)) return null;

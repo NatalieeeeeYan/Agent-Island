@@ -6,10 +6,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { JsonlCursor } from '../src/core/jsonl.js';
 import { MemoryStore } from '../src/core/store.js';
 import { statusFromActivity, ACTIVE_WINDOW_MS } from '../src/core/status.js';
-import { applyHookEvent } from '../src/core/island.js';
+import { applyHookEvent, createIsland } from '../src/core/island.js';
 import { normalizeHookEvent } from '../src/core/hook-server.js';
 import { sessionIdFromFilename } from '../src/core/adapters/codex.js';
-import type { Session } from '../src/core/types.js';
+import type { AgentAdapter, EventSink, Session } from '../src/core/types.js';
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -183,6 +183,93 @@ describe('applyHookEvent', () => {
 
     expect(updated?.status).toBe('running');
     expect(updated?.updatedAt).toBe(9000);
+  });
+});
+
+describe('subscribers', () => {
+  it('receive the stored session, not the adapter’s pre-merge one', async () => {
+    const store = new MemoryStore();
+    let watcherEmit: EventSink | undefined;
+    const adapter: AgentAdapter = {
+      id: 'claude-code',
+      displayName: 'stub',
+      capabilities: { transcript: true, liveEvents: true, usage: true, approval: true },
+      detect: async () => true,
+      scan: async () => [],
+      watch: (emit) => {
+        watcherEmit = emit;
+        return { dispose: () => {} };
+      },
+      forget: () => {},
+    };
+
+    const island = createIsland({ adapters: [adapter], store, hookPort: 7951 });
+    await island.start();
+
+    const seen: Session[] = [];
+    island.subscribe((event) => {
+      if (event.kind === 'session_updated') seen.push(event.session);
+    });
+
+    // A hook has put the session in `waiting`.
+    store.upsert(
+      session({ status: 'waiting', waitingOn: { toolName: 'Bash', summary: 'Bash', since: 2000 } }),
+    );
+
+    // The transcript keeps changing while the agent sits at the prompt, so the
+    // adapter re-reads it and reports `running` — it cannot know about the hook.
+    watcherEmit?.({ kind: 'session_updated', session: session({ status: 'running' }) });
+
+    expect(store.get('s1')?.status).toBe('waiting');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.status).toBe('waiting');
+    expect(seen[0]?.waitingOn?.toolName).toBe('Bash');
+
+    await island.stop();
+  });
+});
+
+describe('sweep', () => {
+  it('drops idle sessions and tells the adapters to release their folds', async () => {
+    const store = new MemoryStore();
+    let forgotten: number | null = null;
+    const adapter: AgentAdapter = {
+      id: 'claude-code',
+      displayName: 'stub',
+      capabilities: { transcript: true, liveEvents: true, usage: true, approval: true },
+      detect: async () => true,
+      scan: async () => [],
+      watch: () => ({ dispose: () => {} }),
+      forget: (before) => {
+        forgotten = before;
+      },
+    };
+
+    const island = createIsland({
+      adapters: [adapter],
+      store,
+      hookPort: 7952,
+      retentionMs: 1000,
+    });
+    await island.start();
+
+    const now = 100_000;
+    store.upsert(session({ id: 'fresh', updatedAt: now - 500 }));
+    store.upsert(session({ id: 'stale', updatedAt: now - 5000 }));
+
+    const removed: string[] = [];
+    island.subscribe((e) => {
+      if (e.kind === 'session_removed') removed.push(e.sessionId);
+    });
+
+    island.sweep(now);
+
+    expect(removed).toEqual(['stale']);
+    expect(store.get('fresh')).toBeDefined();
+    expect(store.get('stale')).toBeUndefined();
+    expect(forgotten).toBe(now - 1000);
+
+    await island.stop();
   });
 });
 

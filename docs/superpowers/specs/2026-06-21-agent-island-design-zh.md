@@ -146,6 +146,33 @@ hook 事件写入一条持久的追加式日志，随 `SqliteStore` 一同落地
 
 ---
 
+### ADR-009 · 会话保留窗口；折叠结果与会话一并淘汰
+
+**日期：** 2026-09-10 · **状态：** 已采纳 · **细化：** ADR-005
+
+会话只在**最近 24 小时内有过活动**时留在岛上。`SessionEnd` hook 到达则立即移除，不等窗口。启动扫描窗口与保留窗口是**同一个值**。淘汰时同时丢弃 `Session` 和适配器里折叠好的 facts。
+
+**为什么必须近似。** Island 读的是文件，不是进程 —— 昨天关掉的终端和今天开着没动的终端在磁盘上完全一样。实测过三种候选信号：
+
+| 信号 | 结论 |
+|---|---|
+| 进程持有 transcript 句柄 | ❌ 不可用。实测 `claude` 进程追加完即关，活跃与历史会话无差别 |
+| 进程存在（`ps` + cwd） | ⚠️ 只能知道"有几个 agent 在跑、cwd 是什么"，**拿不到 session id**，同一 cwd 可开多个会话 |
+| hook 事件 | ✅ 唯一精确到会话的信号，但覆盖不到 Island 启动前就已静默的会话 |
+
+所以用「最近写过盘」近似，并用 `SessionEnd` 让最常见的情况（用户退出）变精确。**卡在审批上的会话不会被误伤** —— 它的 mtime 就是 `PreToolUse` 那一刻，必然在窗口内。
+
+**为什么淘汰必须下探到适配器。** 实测：44 个会话的 `Session` 记录合计只有几十 KB，内存的大头在 `TranscriptTracker` 折叠出的 facts。只清 store 等于没清。因此 `AgentAdapter` 增加 `forget(before)`。
+
+**后果：**
+
+- 被淘汰的会话在其记录**再次变动时完整重建**（标题、cwd、用量全部恢复），代价是一次全量重解析。实测最大的 8.1 MB 记录约 +14.4 MB 瞬时、放大 1.8×。这是刻意的取舍：不活跃零成本，醒来付一次。
+- 恢复时发的是 `session_started` 而非 `session_updated`，所以 UI 的「新会话出现」逻辑对复活同样成立。
+- **`status: 'complete'` 不再可达** —— 原本只有 `SessionEnd` 会设它，现在该事件直接移除会话。类型里暂时保留，待 M2 决定是否需要一个「刚刚完成」的短暂展示态。
+- 所有从会话记录折叠出的文本在解析时即截断到 `PREVIEW_MAX_CHARS`（200 字符）。一条记录行可以装下整个粘贴进来的文件，而只有开头会被显示；不截断就是纯粹的泄漏。
+
+---
+
 ## 3. 架构
 
 ```
@@ -217,6 +244,8 @@ type Session = {
   startedAt: number
   updatedAt: number
   usage?: { inputTokens: number; outputTokens: number; costUSD?: number }
+  lastReply?: string          // agent 最近一句话的开头，纯文本，截到 200 字符
+  parentId?: string           // 有值即表示这是子 agent，值为派发它的会话 id
   waitingOn?: { toolName: string; summary: string }   // M2
 }
 ```
@@ -257,11 +286,30 @@ JSONL 行类型及可用字段：
 
 Hook 配置：`~/.claude/settings.json`（**用户级**，非项目级——要监控所有会话）。
 
+**子 agent 的会话记录**（2026-09-10 实测）：
+
+```
+~/.claude/projects/<cwd 编码>/<session-uuid>.jsonl                        ← 用户开的会话
+~/.claude/projects/<cwd 编码>/<session-uuid>/subagents/agent-<hex>.jsonl  ← 它派发的子 agent
+```
+
+**关键坑：子 agent 记录里每一行的 `sessionId` 都是父会话的。** 拿它当 `Session.id` 会让父会话和它所有子 agent 塌成一条记录，后写的覆盖先写的——实测某个父会话的标题被子 agent 的派发指令顶掉了。所以 id 按文件名判定：`agent-` 前缀的用文件名作 id，行里的 `sessionId` 作 `parentId`。
+
+**这也决定了子 agent 的状态语义。** hook 事件以 `session_id` 为键，而子 agent 用的是父会话的 id，所以子 agent 里的工具审批**天然落在父会话上**——这是对的，用户也是在父会话的终端里点批准。子 agent 完成时结果作为 `tool_result` 回到父会话，不产生独立事件。因此：
+
+- 子 agent 行的状态只可能是文件活动能支持的 `running` / `idle`，**永远不会是 `waiting` 或 `complete`**
+- 子 agent 没有可跳转的终端，UI 必须把它显示为父会话的附属，而不是平级会话
+- 中断（Esc / Ctrl-C）作用在父会话上，子 agent 随之停止，没有独立的中断语义
+
 **标题的三级来源**（2026-09-09 实测）。`ai-title` 不是唯一来源，只用它会让大量会话显示 `(untitled)`：
 
 1. **桌面侧车** `~/Library/Application Support/Claude/claude-code-sessions/<org>/<user>/local_*.json` 的 `title`。Claude Desktop 起的会话写的就是 `~/.claude/projects/` 下的同一批 jsonl，但**不产生 `ai-title` 行**；侧车的 `cliSessionId` 就是那个 jsonl 的 session id。`titleSource: "auto"` 说明它是工具自己生成的，与 `aiTitle` 同级可信。
 2. **`ai-title` 行**的 `aiTitle`。终端会话用这条，但要跑几轮才出现。
-3. **首条 `user` 行的文本**，取首行并截断。仅兜底——注意 `user` 行也承载 `tool_result`（`content` 是数组且块 `type` 为 `tool_result`），那不是提问，不能当标题。
+3. **最后一条 `user` 行的文本**，取首行并截断。仅兜底。
+
+**为什么取最后一条而不是第一条。** 岛上要回答的是「它现在在干什么」，开场白一旦会话往下走就过期了；最新那次提问才对得上当前状态。代价是标题会随会话变化，不能靠它认人——但会话本来就用 id 和 cwd 认。
+
+注意 `user` 行也承载 `tool_result`（`content` 是数组且块 `type` 为 `tool_result`），那不是提问：这类行解析结果为 null，且**不能**因此把已记住的上一条提问清空。
 
 ### Codex
 
@@ -344,7 +392,7 @@ Cowork 本质就是 **Claude Code 跑在桌面 App 里**，会话记录格式与
 
 **容易混淆的两件事，都不是「聊天」，都在支持范围内：**
 
-- **Codex Desktop** 写的就是 `~/.codex/sessions/` 里同一批 rollout（`session_meta.originator = "Codex Desktop"`），现有 Codex 适配器**已经覆盖**。它不写 `session_index.jsonl`，所以标题走首条用户消息兜底。
+- **Codex Desktop** 写的就是 `~/.codex/sessions/` 里同一批 rollout（`session_meta.originator = "Codex Desktop"`），现有 Codex 适配器**已经覆盖**。它不写 `session_index.jsonl`，所以标题走最后一条用户消息兜底。
 - **Claude Desktop 里跑的 Claude Code** 写的就是 `~/.claude/projects/` 里同一批会话记录，现有适配器**已经覆盖**。它不产生 `ai-title` 行，标题在侧车文件里（见下）。
 
 ---
@@ -362,7 +410,7 @@ interface SessionStore {
 }
 ```
 
-- **M1** — `MemoryStore`。启动时各适配器 `scan()` 补齐历史，运行时 `watch()` 增量更新。
+- **M1** — `MemoryStore`。启动时各适配器 `scan()` 补齐历史，运行时 `watch()` 增量更新，按保留窗口定时淘汰（ADR-009）。
 - **M2** — `SqliteStore`（`node:sqlite`），以及 hook 事件日志（ADR-008）。换实现只动实例化那一行。落库的触发条件：模型稳定，且启动扫描变慢到影响体验。
 
 **扫描性能约束：** 本机现有 22 个 Claude Code 会话共 16MB、69 个 Codex 会话。启动时**不全量解析**——按 mtime 只完整解析最近 N 个（默认最近 7 天），更老的走索引文件或惰性加载。
@@ -386,6 +434,18 @@ hook 脚本调用约束：
 
 - **超时 2 秒、fail-open** — Island 没跑就静默退出，绝不能影响 agent
 - 只上报，不阻塞（M1）；M2 的审批走长轮询，另设端点
+
+### 无头视图的指令面（stdin，不是第三个接口）
+
+`npm run dev` 在 TTY 下同时读 stdin 指令：`ls` / `show <id前缀>` / `fire <id前缀> <Event> [toolName]` / `help` / `quit`。实现在 `src/cli/repl.ts`，签名是 `runCommand(line, ctx) => CommandResult` —— 字符串进、字符串出，不碰 stdin/stdout，因此不开 TTY 也能单测。
+
+**为什么塞在同一个进程里，而不是做成第二个可执行文件。** 另起一个进程去查正在跑的 Island，就得给它开一个查询端点，那会让上面「唯一的 HTTP 面」这句话失效。指令走 stdin 则一个字节的 HTTP 面都不增加。
+
+**为什么 `fire` 走真实 HTTP POST，而不是直接调 `applyHookEvent`。** `waiting` 和 `complete` 只有 hook 能给（见 `status.ts`），所以不合成事件就只能靠真去触发一次审批弹窗才能看到这两个状态。既然目的是测试，就必须跑**和真实 hook 完全同一条路径**：信封解析 → 服务器 → 折进 store → 通知订阅者。走捷径测的就不是要测的东西了。
+
+端点按契约恒回 204，拿不到处理结果，所以 `fire` **先在本地 store 解析 id 前缀**，解析不到直接报错、不发请求 —— 既有明确反馈，又不必给端点加返回值。
+
+**id 按最短唯一前缀显示，且逐个计算。** Codex 用 UUIDv7，前导十六进制是时间戳，同一天的会话前 8 位全都一样；但取全局统一宽度会被最难分辨的一对拖到 27 字符，所以每个 id 各算各的，再补空格对齐。
 
 ### 主进程 → 渲染进程（Electron IPC）
 
@@ -465,6 +525,7 @@ ipcMain → 'sessions:removed'
 - [x] Codex 适配器：同上（验证抽象是否诚实）
 - [x] hook 接收端点 + 统一 relay 脚本（幂等 merge 安装 / 卸载）
 - [x] 无头 CLI `npm run dev`：终端实时打印状态流
+- [x] 无头视图的指令面：`ls` / `show` / `fire`，用来在没有真实审批弹窗时驱动状态流转
 - [ ] **待你验证**：装上 hook，跑真实会话，确认 running → waiting → complete 的流转
 
 **M1 完成的判据：** 另开终端跑一个真实的 Claude Code 会话和一个 Codex 会话，CLI 里能实时看到 running → waiting → complete 的状态流转，以及正确的标题、cwd、用量。

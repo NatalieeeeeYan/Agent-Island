@@ -28,6 +28,23 @@ import type {
 
 const WATCH_DEBOUNCE_MS = 200;
 
+/**
+ * Claude Code writes a subagent's transcript to
+ * `<project>/<parent-uuid>/subagents/agent-<hex>.jsonl`, and a real session's
+ * to `<project>/<uuid>.jsonl`. Using the tool's own marker beats inferring one
+ * from row contents, which a session that merely dispatched a subagent shares.
+ *
+ * This matters beyond labelling: every row in a subagent transcript carries the
+ * *parent's* `sessionId`, so keying on that would collapse a parent and all its
+ * subagents onto one record, last write winning.
+ */
+const SUBAGENT_FILE = /^agent-/;
+
+function identify(path: string, facts: ClaudeCodeFacts | undefined): string {
+  const stem = basename(path, '.jsonl');
+  return SUBAGENT_FILE.test(stem) ? stem : (facts?.sessionId ?? stem);
+}
+
 export class ClaudeCodeAdapter implements AgentAdapter {
   readonly id = 'claude-code';
   readonly displayName = 'Claude Code';
@@ -43,8 +60,11 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   readonly #tracker = new TranscriptTracker<ClaudeCodeFacts>(
     emptyClaudeCodeFacts,
     foldClaudeCodeRows,
+    (facts) => facts.lastTimestamp,
   );
   #sidecars = new Map<string, SidecarEntry>();
+  /** Paths already reported, so a re-appearance is announced as a new session. */
+  readonly #seen = new Set<string>();
 
   constructor(options: { root?: string; sidecarRoot?: string } = {}) {
     this.#root = options.root ?? join(homedir(), '.claude', 'projects');
@@ -67,17 +87,22 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     return sessions;
   }
 
+  /** Idle transcripts cost memory in the tracker, not in the store. */
+  forget(before: number): void {
+    for (const path of this.#tracker.prune(before)) this.#seen.delete(path);
+  }
+
   watch(emit: EventSink): Disposable {
-    const seen = new Set(this.#tracker.paths());
+    for (const path of this.#tracker.paths()) this.#seen.add(path);
 
     const refresh = debounceByKey((path: string) => {
-      void this.#refresh(path, seen, emit);
+      void this.#refresh(path, emit);
     }, WATCH_DEBOUNCE_MS);
 
     const watcher = chokidar.watch(this.#root, {
       ignoreInitial: true,
-      // <project-dir>/<session>.jsonl
-      depth: 2,
+      // <project-dir>/<session>.jsonl, and <project-dir>/<session>/subagents/<agent>.jsonl
+      depth: 3,
       awaitWriteFinish: false,
     });
 
@@ -89,10 +114,9 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     });
     watcher.on('unlink', (path) => {
       if (!path.endsWith('.jsonl')) return;
-      const facts = this.#tracker.facts(path);
-      const id = facts?.sessionId ?? basename(path, '.jsonl');
+      const id = identify(path, this.#tracker.facts(path));
       this.#tracker.forget(path);
-      seen.delete(path);
+      this.#seen.delete(path);
       emit({ kind: 'session_removed', sessionId: id });
     });
     watcher.on('error', (error) => {
@@ -137,7 +161,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       // No timestamp means no basis for a status — leave it as first scanned.
       if (!facts || facts.lastTimestamp === null) continue;
 
-      const id = facts.sessionId ?? basename(path, '.jsonl');
+      const id = identify(path, facts);
       if (previous.get(id)?.title === this.#sidecars.get(id)?.title) continue;
 
       const session = this.#build(facts, path, facts.lastTimestamp);
@@ -145,13 +169,13 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     }
   }
 
-  async #refresh(path: string, seen: Set<string>, emit: EventSink): Promise<void> {
+  async #refresh(path: string, emit: EventSink): Promise<void> {
     try {
-      const isNew = !seen.has(path);
+      const isNew = !this.#seen.has(path);
       const facts = await this.#tracker.ingest(path);
       const session = this.#build(facts, path, Date.now());
       if (!session) return;
-      seen.add(path);
+      this.#seen.add(path);
       emit({ kind: isNew ? 'session_started' : 'session_updated', session });
     } catch (error) {
       emit({ kind: 'adapter_error', tool: this.id, message: String(error) });
@@ -159,14 +183,19 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }
 
   #build(facts: ClaudeCodeFacts, path: string, mtimeMs: number): Session | null {
-    const id = facts.sessionId ?? basename(path, '.jsonl');
+    const id = identify(path, facts);
     const lastActivity = facts.lastTimestamp ?? mtimeMs;
+    const isSubagent = SUBAGENT_FILE.test(basename(path, '.jsonl'));
 
     const session: Session = {
       id,
       tool: this.id,
       title:
-        this.#sidecars.get(id)?.title ?? facts.title ?? titleFromMessage(facts.firstUserMessage),
+        this.#sidecars.get(id)?.title ??
+        facts.title ??
+        titleFromMessage(facts.lastUserMessage) ??
+        // Its dispatch prompt is all a subagent transcript has.
+        (isSubagent ? titleFromMessage(facts.lastSidechainMessage) : null),
       cwd: facts.cwd ?? '',
       status: statusFromActivity(lastActivity),
       startedAt: facts.firstTimestamp ?? mtimeMs,
@@ -176,6 +205,9 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     if (facts.model !== null) session.model = facts.model;
     if (facts.gitBranch !== null) session.gitBranch = facts.gitBranch;
     if (facts.usage !== null) session.usage = facts.usage;
+    if (facts.lastReply !== null) session.lastReply = facts.lastReply;
+    // The rows carry the dispatching session's id, which is exactly the link.
+    if (isSubagent && facts.sessionId !== null) session.parentId = facts.sessionId;
     return session;
   }
 }

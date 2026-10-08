@@ -28,6 +28,52 @@ watching… (ctrl-c to stop)
 
 Start a real Claude Code or Codex session in another terminal and the transitions appear live.
 
+## Commands while it runs
+
+On a TTY the same process also takes commands. The live stream keeps printing
+around the prompt.
+
+```
+> ls waiting
+(none)
+
+> fire 94d92866 Notification Bash
+23:31:03   ⏸ claude-code 实现进度检查   ~/ME/Projects/Agent_Island  200.5k out
+posted Notification for 94d92866
+
+> show 94d92866
+id       94d92866-a22c-432c-b957-6f07b4fb3b48
+status   waiting
+waiting  Bash since 23:31:03
+usage    202.4k out
+source   ~/.claude/projects/…/94d92866-….jsonl
+```
+
+| Command | Purpose |
+|---------|---------|
+| `ls [status\|tool]` | List sessions, newest first |
+| `show <id-prefix>` | Everything known about one session, including its latest reply |
+| `fire <id-prefix> <Event> [toolName]` | Post a synthetic hook event |
+| `help` / `quit` | |
+
+`fire` exists because `waiting` and `complete` come only from hooks, so without
+it you cannot see those states without provoking a real approval prompt. It
+posts to the hook endpoint over HTTP rather than reaching into the store, so a
+test exercises the same path a real hook takes. The session is resolved locally
+first — the endpoint answers `204` by contract, so an unknown id would otherwise
+be a silent no-op.
+
+Ids are printed at the shortest prefix that is unambiguous, which is longer for
+Codex: its UUIDv7 ids begin with a timestamp, so same-day sessions share their
+leading characters.
+
+Piped or redirected output (`npm run dev > log`) skips the prompt entirely and
+behaves as a plain log.
+
+**There is deliberately no `tsx watch` variant.** Watch mode binds the Return
+key to "restart the process", so under it a command can never be submitted —
+every Enter reloads the app instead. Restart by hand after editing.
+
 ## Hooks
 
 Transcripts alone say what an agent did, not whether it is *blocked on you* — a
@@ -64,7 +110,10 @@ src/core/            zero Electron dependencies — runs under plain node
   hook-install.ts      idempotent merge into the tools' settings files
   parsers/             per-tool transcript folding, pure functions
   adapters/            per-tool scan + watch
-src/cli/dev.ts       headless entry point
+src/cli/
+  dev.ts               headless entry point; wires the terminal to the REPL
+  repl.ts              command dispatch — strings in, strings out, no TTY
+  format.ts            rendering shared by the live stream and the commands
 hooks/               the relay script installed into the tools
 tests/fixtures/      slices of real transcripts from this machine
 ```
@@ -75,6 +124,13 @@ tests/fixtures/      slices of real transcripts from this machine
 transcript, live events, usage data, and approval interception. The UI branches
 on these — a tool that reports no cost shows no cost field, not a `—` that reads
 as zero. Codex, for instance, reports tokens but no dollar amount.
+
+**Only recent sessions, and only their opening lines.** A session stays listed
+while it has been active in the last 24 hours; `SessionEnd` drops it at once.
+Every text folded out of a transcript is clipped to 200 characters at parse
+time, because one row can hold a whole pasted file while only its opening is
+ever shown. An evicted session is rebuilt in full the next time its transcript
+changes — idle costs nothing, waking up pays one re-parse. See ADR-009.
 
 **Status is only as precise as the evidence.** A transcript supports `running`
 and `idle`; `waiting` and `complete` come from hooks; `error` comes from an
@@ -89,7 +145,7 @@ tool's implementation.
 
 | Command | Purpose |
 |---------|---------|
-| `npm run dev` | Headless backend with live output (watch mode) |
+| `npm run dev` | Headless backend with the live stream and commands (`npm start` is the same) |
 | `npm test` | Vitest suite |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run hooks:dry` | Preview hook installation |

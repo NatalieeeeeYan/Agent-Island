@@ -1,5 +1,5 @@
 import type { Usage } from '../types.js';
-import { num, obj, str, timestamp } from './util.js';
+import { clip, num, obj, replyText, str, stripInjected, timestamp } from './util.js';
 
 /**
  * Facts extractable from a Codex rollout
@@ -10,12 +10,15 @@ import { num, obj, str, timestamp } from './util.js';
  *
  * Note the title is *not* in the rollout — it lives in
  * `~/.codex/session_index.jsonl` as `thread_name`, which the adapter joins in.
- * Codex Desktop does not write that index, so `firstUserMessage` is kept as a
- * fallback for sessions the index never learns about.
+ * Codex Desktop does not write that index, so `lastUserMessage` is kept as a
+ * fallback for sessions the index never learns about — the latest ask, since
+ * what the agent is working on now is what a glance at the island needs.
  */
 export type CodexFacts = {
   sessionId: string | null;
-  firstUserMessage: string | null;
+  lastUserMessage: string | null;
+  /** Opening of the agent's most recent prose reply. */
+  lastReply: string | null;
   cwd: string | null;
   model: string | null;
   cliVersion: string | null;
@@ -36,7 +39,8 @@ export type CodexFacts = {
 export function emptyCodexFacts(): CodexFacts {
   return {
     sessionId: null,
-    firstUserMessage: null,
+    lastUserMessage: null,
+    lastReply: null,
     cwd: null,
     model: null,
     cliVersion: null,
@@ -99,7 +103,13 @@ function applyEventMsg(
 ): void {
   switch (str(payload['type'])) {
     case 'user_message': {
-      facts.firstUserMessage ??= str(payload['message']);
+      const message = str(payload['message']);
+      const asked = message === null ? null : clip(stripInjected(message));
+      facts.lastUserMessage = asked ?? facts.lastUserMessage;
+      break;
+    }
+    case 'agent_message': {
+      facts.lastReply = replyText(str(payload['message'])) ?? facts.lastReply;
       break;
     }
     case 'task_started': {

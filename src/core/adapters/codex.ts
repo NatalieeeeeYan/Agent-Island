@@ -41,8 +41,14 @@ export class CodexAdapter implements AgentAdapter {
   readonly #home: string;
   readonly #sessionsRoot: string;
   readonly #indexPath: string;
-  readonly #tracker = new TranscriptTracker<CodexFacts>(emptyCodexFacts, foldCodexRows);
+  readonly #tracker = new TranscriptTracker<CodexFacts>(
+    emptyCodexFacts,
+    foldCodexRows,
+    (facts) => facts.lastTimestamp,
+  );
   #index = new Map<string, CodexIndexEntry>();
+  /** Paths already reported, so a re-appearance is announced as a new session. */
+  readonly #seen = new Set<string>();
 
   constructor(options: { home?: string } = {}) {
     this.#home = options.home ?? join(homedir(), '.codex');
@@ -66,11 +72,16 @@ export class CodexAdapter implements AgentAdapter {
     return sessions;
   }
 
+  /** Idle transcripts cost memory in the tracker, not in the store. */
+  forget(before: number): void {
+    for (const path of this.#tracker.prune(before)) this.#seen.delete(path);
+  }
+
   watch(emit: EventSink): Disposable {
-    const seen = new Set(this.#tracker.paths());
+    for (const path of this.#tracker.paths()) this.#seen.add(path);
 
     const refresh = debounceByKey((path: string) => {
-      void this.#refresh(path, seen, emit);
+      void this.#refresh(path, emit);
     }, WATCH_DEBOUNCE_MS);
 
     const rollouts = chokidar.watch(this.#sessionsRoot, {
@@ -90,7 +101,7 @@ export class CodexAdapter implements AgentAdapter {
       if (!path.endsWith('.jsonl')) return;
       const id = this.#tracker.facts(path)?.sessionId ?? sessionIdFromFilename(path);
       this.#tracker.forget(path);
-      seen.delete(path);
+      this.#seen.delete(path);
       emit({ kind: 'session_removed', sessionId: id });
     });
     rollouts.on('error', (error) => {
@@ -123,13 +134,13 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
-  async #refresh(path: string, seen: Set<string>, emit: EventSink): Promise<void> {
+  async #refresh(path: string, emit: EventSink): Promise<void> {
     try {
-      const isNew = !seen.has(path);
+      const isNew = !this.#seen.has(path);
       const facts = await this.#tracker.ingest(path);
       const session = this.#build(facts, path, Date.now());
       if (!session) return;
-      seen.add(path);
+      this.#seen.add(path);
       emit({ kind: isNew ? 'session_started' : 'session_updated', session });
     } catch (error) {
       emit({ kind: 'adapter_error', tool: this.id, message: String(error) });
@@ -145,7 +156,7 @@ export class CodexAdapter implements AgentAdapter {
       id,
       tool: this.id,
       // Codex Desktop never registers in the index, so fall back to the prompt.
-      title: entry?.threadName ?? titleFromMessage(facts.firstUserMessage),
+      title: entry?.threadName ?? titleFromMessage(facts.lastUserMessage),
       cwd: facts.cwd ?? '',
       status: facts.lastError !== null ? 'error' : statusFromActivity(lastActivity),
       startedAt: facts.firstTimestamp ?? mtimeMs,
@@ -154,6 +165,7 @@ export class CodexAdapter implements AgentAdapter {
     };
     if (facts.model !== null) session.model = facts.model;
     if (facts.usage !== null) session.usage = facts.usage;
+    if (facts.lastReply !== null) session.lastReply = facts.lastReply;
     return session;
   }
 }

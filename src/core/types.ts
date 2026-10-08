@@ -53,6 +53,22 @@ export type Session = {
   model?: string;
   gitBranch?: string;
   usage?: Usage;
+  /**
+   * Opening of the agent's most recent prose reply — plain text only, no tool
+   * calls, thinking or attachments. Capped at `PREVIEW_MAX_CHARS`; a renderer
+   * may show less. Gives a glance at what the agent is actually saying.
+   */
+  lastReply?: string;
+  /**
+   * Set when this is a subagent dispatched by another session rather than one
+   * the user started: the id of the session that dispatched it.
+   *
+   * A subagent has no terminal to jump to, and its transcript carries the
+   * *parent's* session id — so hook events, keyed by session id, land on the
+   * parent. Its own status can therefore only ever be what file activity
+   * supports, never `waiting` or `complete`.
+   */
+  parentId?: string;
   waitingOn?: WaitingOn;
   /** Absolute path of the transcript this session was derived from. */
   sourcePath?: string;
@@ -100,6 +116,15 @@ export interface AgentAdapter {
 
   /** Begin incremental watching. Returns a handle that stops all watchers. */
   watch(emit: EventSink): Disposable;
+
+  /**
+   * Release cached state for transcripts idle since `before`.
+   *
+   * The cached fold, not the `Session`, is what actually holds memory. A
+   * forgotten transcript is re-read in full the next time it changes, so the
+   * session comes back complete — at the cost of one re-parse.
+   */
+  forget(before: number): void;
 }
 
 export type ScanOptions = {

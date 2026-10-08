@@ -6,7 +6,7 @@ import { parseSidecar } from '../src/core/claude-desktop-sidecar.js';
 import { readJsonl } from '../src/core/jsonl.js';
 import { foldClaudeCodeRows } from '../src/core/parsers/claude-code.js';
 import { foldCodexRows, parseCodexIndex } from '../src/core/parsers/codex.js';
-import { titleFromMessage } from '../src/core/parsers/util.js';
+import { PREVIEW_MAX_CHARS, titleFromMessage } from '../src/core/parsers/util.js';
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
@@ -63,20 +63,117 @@ describe('claude code parser', () => {
     expect(facts.title).toBe('Still parsed');
   });
 
-  it('keeps the first human prompt and ignores tool results', () => {
+  it('keeps the latest human prompt, not the first', () => {
     const facts = foldClaudeCodeRows([
       {
         type: 'user',
         message: { role: 'user', content: [{ type: 'text', text: 'first prompt' }] },
       },
       { type: 'user', message: { role: 'user', content: 'second prompt' } },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('second prompt');
+  });
+
+  it('does not let a tool result blank out the last prompt', () => {
+    const facts = foldClaudeCodeRows([
+      { type: 'user', message: { role: 'user', content: 'the real prompt' } },
       {
         type: 'user',
-        message: { role: 'user', content: [{ type: 'tool_result', content: 'not a prompt' }] },
+        message: { role: 'user', content: [{ type: 'tool_result', content: 'ls output' }] },
       },
     ]);
 
-    expect(facts.firstUserMessage).toBe('first prompt');
+    expect(facts.lastUserMessage).toBe('the real prompt');
+  });
+
+  it('ignores a subagent dispatch prompt written into a sidechain turn', () => {
+    const facts = foldClaudeCodeRows([
+      { type: 'user', message: { role: 'user', content: 'what the user asked' } },
+      {
+        type: 'user',
+        isSidechain: true,
+        message: { role: 'user', content: "You are reviewing one task's implementation…" },
+      },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('what the user asked');
+  });
+
+  it('ignores slash-command echoes the tool wrote into the user turn', () => {
+    const facts = foldClaudeCodeRows([
+      { type: 'user', message: { role: 'user', content: 'what the user asked' } },
+      {
+        type: 'user',
+        message: { role: 'user', content: '<local-command-stdout>Goodbye!</local-command-stdout>' },
+      },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('what the user asked');
+  });
+
+  it('keeps the question that follows an attachment placeholder', () => {
+    const facts = foldClaudeCodeRows([
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: '[external unsupported block: image]\n\n这张图里是什么？',
+        },
+      },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('这张图里是什么？');
+  });
+
+  it('keeps the question that follows a multi-line injected block', () => {
+    const facts = foldClaudeCodeRows([
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: '<local-command-caveat>Caveat:\nmore caveat\n</local-command-caveat>\nfix the parser',
+        },
+      },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('fix the parser');
+  });
+
+  it('caps a pasted file instead of retaining all of it', () => {
+    const pasted = 'x'.repeat(50_000);
+    const facts = foldClaudeCodeRows([{ type: 'user', message: { role: 'user', content: pasted } }]);
+
+    expect(facts.lastUserMessage!.length).toBeLessThanOrEqual(PREVIEW_MAX_CHARS);
+  });
+
+  it('takes prose from an assistant turn, not its thinking or tool calls', () => {
+    const facts = foldClaudeCodeRows([
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'thinking', thinking: 'internal reasoning' },
+            { type: 'text', text: 'Here is what I found.' },
+            { type: 'tool_use', name: 'Bash', input: {} },
+          ],
+        },
+      },
+    ]);
+
+    expect(facts.lastReply).toBe('Here is what I found.');
+  });
+
+  it('does not let a tool-only turn blank out the last reply', () => {
+    const spoke = foldClaudeCodeRows([
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Working on it.' }] } },
+    ]);
+    const acted = foldClaudeCodeRows(
+      [{ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] } }],
+      spoke,
+    );
+
+    expect(acted.lastReply).toBe('Working on it.');
   });
 
   it('records no prompt when every user row is a tool result', () => {
@@ -87,7 +184,7 @@ describe('claude code parser', () => {
       },
     ]);
 
-    expect(facts.firstUserMessage).toBeNull();
+    expect(facts.lastUserMessage).toBeNull();
   });
 });
 
@@ -179,13 +276,34 @@ describe('codex parser', () => {
     expect(facts.usage).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 14959 });
   });
 
-  it('keeps the first user message as a title fallback', () => {
+  it('takes the agent’s latest reply as one flat line', () => {
+    const facts = foldCodexRows([
+      { type: 'event_msg', payload: { type: 'agent_message', message: 'first thing' } },
+      { type: 'event_msg', payload: { type: 'agent_message', message: 'second\n\nthing' } },
+    ]);
+
+    expect(facts.lastReply).toBe('second thing');
+  });
+
+  it('keeps the latest user message as a title fallback', () => {
     const facts = foldCodexRows([
       { type: 'event_msg', payload: { type: 'user_message', message: 'first ask' } },
       { type: 'event_msg', payload: { type: 'user_message', message: 'second ask' } },
     ]);
 
-    expect(facts.firstUserMessage).toBe('first ask');
+    expect(facts.lastUserMessage).toBe('second ask');
+  });
+
+  it('ignores slash-command output echoed as a user message', () => {
+    const facts = foldCodexRows([
+      { type: 'event_msg', payload: { type: 'user_message', message: 'the real ask' } },
+      {
+        type: 'event_msg',
+        payload: { type: 'user_message', message: '<local-command-stdout>Goodbye!</...>' },
+      },
+    ]);
+
+    expect(facts.lastUserMessage).toBe('the real ask');
   });
 });
 

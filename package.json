@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "tsx watch src/cli/dev.ts",
+    "dev": "tsx src/cli/dev.ts",
     "start": "tsx src/cli/dev.ts",
     "test": "vitest run",
     "test:watch": "vitest",
