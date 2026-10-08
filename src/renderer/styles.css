@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* Frameless transparent window: the capsule itself is the only painted surface */
+body {
+  background: transparent;
+  overflow: hidden;
+  font-family: ui-sans-serif, -apple-system, system-ui, sans-serif;
+}
